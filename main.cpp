@@ -15,6 +15,10 @@
 #include "RKComm.h"
 #include "RKDevice.h"
 #include "RKImage.h"
+//TJ
+#include <thread>
+#include <vector>
+
 extern const char *szManufName[];
 CRKLog *g_pLogObject=NULL;
 CONFIG_ITEM_VECTOR g_ConfigItemVec;
@@ -1806,22 +1810,27 @@ bool download_boot(STRUCT_RKDEVICE_DESC &dev, char *szLoader)
 		}
 
 		pDevice->SetObject(pImage, pComm, g_pLogObject);
-		printf("Downloading bootloader...\r\n");
+
 		iRet = pDevice->DownloadBoot();
 
 		CURSOR_MOVEUP_LINE(1);
 		CURSOR_DEL_LINE;
 		if (iRet == 0) {
 			bSuccess = true;
-			printf("Downloading bootloader succeeded.\r\n");
+			usleep(10000);
 		}
 		else
-			printf("Downloading bootloader failed!\r\n");
-
+		{
+			printf("Downloading bootloader failed! %x\r\n",dev.uiLocationID);
+		}
 		if (pImage)
+		{
 			delete pImage;
+		}
 		if(pDevice)
+		{
 			delete pDevice;
+		}
 	}
 	return bSuccess;
 }
@@ -2782,6 +2791,7 @@ bool write_sparse_lba(STRUCT_RKDEVICE_DESC &dev, UINT uiBegin, UINT uiSize, char
 						}
 						goto Exit_WriteSparseLBA;
 					}
+
 					if (bFirst) {
 						if (iTotalWrite >= 1024)
 							printf("Write LBA from file (%lld%%)\r\n", (iTotalWrite / 1024) * 100 / (iFileSize / 1024));
@@ -2899,6 +2909,9 @@ bool write_lba(STRUCT_RKDEVICE_DESC &dev, UINT uiBegin, char *szFile)
 		iRet = fseeko(file, 0, SEEK_END);
 		iFileSize = ftello(file);
 		fseeko(file, 0, SEEK_SET);
+
+		printf("Write LBA on device = %x \n",dev.uiLocationID);
+
 		while(iTotalWrite < iFileSize) {
 			memset(pBuf, 0, nSectorSize * DEFAULT_RW_LBA);
 			iWrite = iRead= fread(pBuf, 1, nSectorSize * DEFAULT_RW_LBA, file);
@@ -2907,22 +2920,23 @@ bool write_lba(STRUCT_RKDEVICE_DESC &dev, UINT uiBegin, char *szFile)
 			if(ERR_SUCCESS == iRet) {
 				uiBegin += uiLen;
 				iTotalWrite += iWrite;
+
 				if (bFirst) {
 					if (iTotalWrite >= 1024)
-						printf("Write LBA from file (%lld%%)\r\n", (iTotalWrite / 1024) * 100 / (iFileSize / 1024));
+						printf("Write LBA from file (%lld%%) : Dev = %x \r\n", (iTotalWrite / 1024) * 100 / (iFileSize / 1024),dev.uiLocationID);
 					else
-						printf("Write LBA from file (%lld%%)\r\n", iTotalWrite * 100 / iFileSize);
+						printf("Write LBA from file (%lld%%) : Dev = %x \r\n", iTotalWrite * 100 / iFileSize,dev.uiLocationID);
 					bFirst = false;
 				} else {
 					CURSOR_MOVEUP_LINE(1);
 					CURSOR_DEL_LINE;
-					printf("Write LBA from file (%lld%%)\r\n", (iTotalWrite / 1024) * 100 / (iFileSize / 1024));
+					printf("Write LBA from file (%lld%%) : Dev = %x\r\n", (iTotalWrite / 1024) * 100 / (iFileSize / 1024),dev.uiLocationID);
 				}
 			} else {
 				if (g_pLogObject)
 					g_pLogObject->Record("Error: RKU_WriteLBA failed, err=%d", iRet);
 
-				printf("Write LBA failed!\r\n");
+				printf("Write LBA failed : Dev = %x!\r\n",dev.uiLocationID);
 				goto Exit_WriteLBA;
 			}
 		}
@@ -3045,6 +3059,50 @@ void list_device(CRKScan *pScan)
 }
 
 
+// The function we want to execute on the new thread.
+//bool task1(STRUCT_RKDEVICE_DESC *dev, string *szLoader, int *blCount)
+//bool task1(STRUCT_RKDEVICE_DESC *dev, string *szLoader)
+void task1(STRUCT_RKDEVICE_DESC *dev, string *szLoader, bool *result)
+{
+	bool bSuccess = false;
+	
+	string s = *szLoader;
+	
+	bSuccess = download_boot(*dev, (char *)s.c_str());
+	if (bSuccess)
+		printf("Device %x Pass\n",dev->uiLocationID);
+	else
+		printf("Device %x Fail\n",dev->uiLocationID);
+
+	*result = bSuccess;
+	usleep(10000);
+	//return bSuccess;
+	//return (void*) result;
+}
+
+//bool task2(STRUCT_RKDEVICE_DESC *dev, UINT *uiBegin, string *sw)
+void task2(STRUCT_RKDEVICE_DESC *dev, UINT *uiBegin, string *sw,  bool *result)
+{
+	bool bSuccess = false;
+	UINT temp = *uiBegin;
+
+	string s = *sw;
+
+	bSuccess = write_lba(*dev, (u32)temp, (char *)s.c_str());
+
+	if (bSuccess)
+		printf("Device %x Pass\n",dev->uiLocationID);
+	else
+		printf("Device %x Fail\n",dev->uiLocationID);
+
+	*result = bSuccess;
+	usleep(10000);
+
+	//return bSuccess;
+}
+
+
+
 bool handle_command(int argc, char* argv[], CRKScan *pScan)
 {
 	string strCmd;
@@ -3099,7 +3157,7 @@ bool handle_command(int argc, char* argv[], CRKScan *pScan)
 		NORMAL_COLOR_ATTR;
 		printf("\r\n");
 		return bSuccess;
-	} else if (cnt > 1) {
+	} else if (cnt > 5) {	//TJ was 1
 		ERROR_COLOR_ATTR;
 		printf("Found too many rockusb devices, please plug devices out!");
 		NORMAL_COLOR_ATTR;
@@ -3107,21 +3165,44 @@ bool handle_command(int argc, char* argv[], CRKScan *pScan)
 		return bSuccess;
 	}
 
-	bRet = pScan->GetDevice(dev, 0);
-	if (!bRet) {
-		ERROR_COLOR_ATTR;
-		printf("Getting information about rockusb device failed!");
-		NORMAL_COLOR_ATTR;
-		printf("\r\n");
-		return bSuccess;
+	STRUCT_RKDEVICE_DESC device[cnt];
+
+	for (i=0;i<cnt;i++)
+	{
+		bRet = pScan->GetDevice(device[i], i);
+		if (!bRet) {
+			ERROR_COLOR_ATTR;
+			printf("Getting information about rockusb device failed!");
+			NORMAL_COLOR_ATTR;
+			printf("\r\n");
+			return bSuccess;
+		}
 	}
 
 	if(strcmp(strCmd.c_str(), "RD") == 0) {
 		if ((argc != 2) && (argc != 3))
 			printf("Parameter of [RD] command is invalid, please check help!\r\n");
 		else {
-			if (argc == 2)
-				bSuccess = reset_device(dev);
+			if (argc == 2) {
+
+				bool res[cnt] = {false};
+    			for (int i = 0; i < cnt; i++) {
+					res[i] = reset_device(device[i]);
+					usleep(10000);
+				}
+
+				bool btestPassed = true;
+				for (int i = 0; i < cnt; i++) {
+					if (!res[i])
+					{
+						btestPassed = false;
+						break;
+					}
+				}
+
+				if (btestPassed)
+					bSuccess = true;
+			}
 			else {
 				UINT uiSubCode;
 				char *pszEnd;
@@ -3150,13 +3231,41 @@ bool handle_command(int argc, char* argv[], CRKScan *pScan)
 		if (argc > 2) {
 			string strLoader;
 			strLoader = argv[2];
-			bSuccess = download_boot(dev, (char *)strLoader.c_str());
+
+			std::vector<thread> threads(cnt);
+			bool res[cnt] = {false};
+    		// spawn threads:
+    		for (int i = 0; i < cnt; i++) {
+				printf("Start BL download : Device %x\r\n",device[i].uiLocationID);
+				threads[i] = thread(task1, &device[i], &strLoader, &res[i]);
+				//usleep(1000000);
+    		}
+
+			usleep(1000000);
+
+    		for (auto& th : threads) {
+        		th.join();
+    		}
+
+			bSuccess = true;
+			
+			for (int i = 0; i < cnt; i++) {
+				if (!res[i]) {
+					bSuccess = false;
+					break;
+				}
+				else 
+					printf("BL_DL_Pass %x\n",device[i].uiLocationID);
+			}
+
 		} else if (argc == 2) {
 			ret = find_config_item(g_ConfigItemVec, "loader");
 			if (ret == -1)
 				printf("Did not find loader item in config!\r\n");
 			else
+			{
 				bSuccess = download_boot(dev, g_ConfigItemVec[ret].szItemValue);
+			}
 		} else
 			printf("Parameter of [DB] command is invalid, please check help!\r\n");
 	} else if(strcmp(strCmd.c_str(), "GPT") == 0) {
@@ -3200,7 +3309,37 @@ bool handle_command(int argc, char* argv[], CRKScan *pScan)
 					if (is_ubifs_image(argv[3]))
 						bSuccess = erase_ubi_block(dev, (u32)uiBegin, (u32)-1);
 					if (bSuccess)
-						bSuccess = write_lba(dev, (u32)uiBegin, argv[3]);
+					{
+						//*******
+						string strSW;
+						strSW = argv[3];
+
+						std::vector<thread> threads(cnt);
+						bool res[cnt] = {false};
+
+			    		// spawn n threads:
+			    		for (int i = 0; i < cnt; i++) {
+							printf("Start SW download : Device %x\r\n",device[i].uiLocationID);
+							threads[i] = thread(task2, &device[i], &uiBegin, &strSW, &res[i]);
+			    		}
+
+						usleep(1000000);
+
+			    		for (auto& th : threads) {
+			        		th.join();
+			    		}
+
+						printf("back to main thread\r\n");
+
+						for (int i = 0; i < cnt; i++) {
+							if (!res[i]) {
+								bSuccess = false;
+								break;
+							}
+							else
+								printf("SW_DL_Pass %x\n",device[i].uiLocationID);
+						}
+					}
 					else
 						printf("Failure of Erase for writing ubi image!\r\n");
 				}
